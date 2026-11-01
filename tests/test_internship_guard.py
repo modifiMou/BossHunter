@@ -127,7 +127,57 @@ def test_collector_waits_for_detail_then_guards(title, jd, count):
     _, items, events, scripts = collect_fixture(title, jd)
     assert JS_EXTRACT_DETAIL in scripts  # type missing on card must reach JD
     assert len(items) == count
-    assert sum(bool(e.get("increment_filtered")) for e in events) == 1 - count
+    filtered_events = [e for e in events if e.get("increment_filtered")]
+    assert len(filtered_events) == 1 - count
+    # #308: detail-stage rejections carry the merged candidate, so the
+    # orchestrator can write the filter record beyond the counting event.
+    if not count:
+        assert filtered_events[0]["filtered_candidate"].title == title
+
+
+def test_orchestrator_records_detail_stage_filter(tmp_path):
+    from bosshunter.collection.orchestrator import CollectionOrchestrator
+    from bosshunter.collection.registry import CollectorRegistry
+
+    row = {"title": "软件测试", "company": "测试企业", "url": "/job_detail/guard.html", "salary": "10-20K"}
+
+    def evaluate(_target, script):
+        if script == JS_VERIFY_INTERNSHIP_FILTER:
+            return True
+        if script == JS_DETECT_COLLECTION_RISK:
+            return json.dumps({"risk": None})
+        if script == JS_EXTRACT_LIST:
+            return json.dumps([row])
+        if script == JS_EXTRACT_DETAIL:
+            return json.dumps({**row, "jd": "负责功能测试与回归，熟悉自动化工具"})
+        return "{}"
+
+    browser = BossBrowser(
+        new_tab=lambda *_a, **_kw: "fixture", close_tab=lambda _t: True,
+        evaluate=evaluate, navigate=lambda *_a: True,
+        scroll=lambda *_a, **_kw: True, wait_for_load=lambda *_a, **_kw: True,
+    )
+    throttle = MagicMock()
+    throttle.wait.return_value = False
+    collector = BossCollector(
+        browser=browser, config=deepcopy(CONFIG),
+        throttle_factory=lambda **_kw: throttle, sleep=lambda _s: None,
+    )
+    options = {"platform_order": ["boss"], "platforms": {"boss": {
+        "keywords": ["Go"], "cities": ["深圳"], "city_codes": {"深圳": "101280600"},
+        "max_pages": 1, "sort": "default", "filters": {"job_type": ["实习"]},
+    }}}
+    result = CollectionOrchestrator(
+        deepcopy(CONFIG), db_path=tmp_path / "guard.db", registry=CollectorRegistry({"boss": lambda: collector}),
+    ).run(options)
+    state = result["platforms"]["boss"]
+    assert state["filtered"] == 1
+    records = state["filter_records"]
+    assert len(records) == 1
+    assert records[0]["title"] == "软件测试"
+    assert records[0]["company"] == "测试企业"
+    assert "待核实" in records[0]["reason"]
+    assert records[0]["source_job_id"] == "guard"
 
 
 @pytest.mark.parametrize("applied", [False, None, "true", {}])
